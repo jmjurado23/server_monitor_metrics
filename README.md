@@ -63,12 +63,21 @@ python3 collect.py --list              # apps found: registered + apps.json
 python3 collect.py --forget <app_id>   # an app removed from the server
 ```
 
-Then add the snippets in [`server/nginx-wallmon.conf`](server/nginx-wallmon.conf):
-- the `wallmon` log format (adds response time and host),
-- a `/internal/` block for every site,
-- the basic-auth `status.json` location on one site.
+Then prepare nginx. `nginx_setup.py` finds the server blocks of every app the collector
+knows and shows the exact diff first:
 
-Finish with `sudo nginx -t && sudo systemctl reload nginx`.
+```sh
+python3 nginx_setup.py                  # dry run: shows the diff, changes nothing
+sudo python3 nginx_setup.py --apply     # from a real terminal: asks for the wallmon password
+```
+
+It adds the `wallmon` log format to the apps' `access_log` lines (traffic per app and
+response times), a `location ^~ /internal/ { return 404; }` to each app's HTTPS block, and
+publishes `https://<first app>/wallmon/status.json` behind basic auth (`--status-domain`
+picks another site). It also points `apps.json` at the log file the apps write to. Every
+changed file is backed up to `/etc/nginx/wallmon-backup-<date>/`, `nginx -t` must pass or
+the backup is restored, and running it again changes nothing. To do it by hand instead,
+see [`server/nginx-wallmon.conf`](server/nginx-wallmon.conf).
 
 `apps.json` options worth knowing:
 - `apps`: only sites **without** the gem (public check, TLS, traffic), or server-side

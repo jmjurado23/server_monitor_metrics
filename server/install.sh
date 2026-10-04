@@ -34,4 +34,7 @@ if ! crontab -l 2>/dev/null | grep -qF "$here/collect.py"; then
   (crontab -l 2>/dev/null; echo "$line") | crontab -
   echo ">> cron installed: runs every minute"
 fi
-echo ">> next: nginx snippet in $here/nginx-wallmon.conf, then: sudo nginx -t && sudo systemctl reload nginx"
+echo ">> next: prepare nginx (shows the diff first, changes nothing):"
+echo "     python3 $here/nginx_setup.py"
+echo "   then, from a real terminal (it asks for passwords):"
+echo "     sudo python3 $here/nginx_setup.py --apply"
