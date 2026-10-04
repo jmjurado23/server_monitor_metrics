@@ -1,5 +1,6 @@
 import http.server
 import json
+import socketserver
 import os
 import sys
 import tempfile
@@ -345,7 +346,7 @@ class RegisteredRunTest(unittest.TestCase):
         register(self.config["registry_dir"], id="fake", name="Fake App", url="http://127.0.0.1:%d" % self.port)
         app = collect.collect(self.config, {}, int(time.time()))["apps"][0]
         self.assertEqual("unconfigured", app["metrics"]["status"])
-        self.assertIn("port unknown", app["metrics"]["error"])
+        self.assertIn("address unknown", app["metrics"]["error"])
 
     def test_forget_and_list(self):
         cfg_path = os.path.join(self.dir.name, "apps.json")
@@ -359,6 +360,77 @@ class RegisteredRunTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.config["registry_dir"], "fake.json")))
         with open(self.state_path) as f:
             self.assertNotIn("fake", json.load(f).get("app_states", {}))
+
+
+class UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    daemon_threads = True
+
+
+class UnixSocketTest(unittest.TestCase):
+    """Apps bound to unix:///tmp/<app>.socket, like the production ones."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        d = self.dir.name
+        self.sock = os.path.join(d, "app.socket")
+        self.server = UnixHTTPServer(self.sock, FakeHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        with open(os.path.join(d, "token"), "w") as f:
+            f.write(TOKEN)
+        self.tcp = http.server.HTTPServer(("127.0.0.1", 0), FakeHandler)
+        self.port = self.tcp.server_address[1]
+        threading.Thread(target=self.tcp.serve_forever, daemon=True).start()
+        self.config = {"token_file": os.path.join(d, "token"), "disk_paths": [d],
+                       "registry_dir": os.path.join(d, "apps.d")}
+
+    def tearDown(self):
+        for srv in (self.server, self.tcp):
+            srv.shutdown()
+            srv.server_close()
+        self.dir.cleanup()
+        FakeHandler.EXTRA = {}
+
+    def test_metrics_and_liveness_over_unix_socket(self):
+        FakeHandler.EXTRA = {"monitor": {"id": "radio"}}
+        register(self.config["registry_dir"], id="radio", name="Radio",
+                 url="http://127.0.0.1:%d" % self.port, socket=self.sock, port=None)
+        app = collect.collect(self.config, {}, int(time.time()))["apps"][0]
+        self.assertEqual("ok", app["metrics"]["status"])
+        self.assertEqual(self.sock, app["metrics"]["via"])
+        self.assertTrue(app["port_open"])
+        self.assertEqual(self.sock, app["socket"])
+
+    def test_wrong_app_on_the_address_is_rejected(self):
+        # v0.2 registered every app on port 3000; only one of them is really there.
+        FakeHandler.EXTRA = {"monitor": {"id": "cocina"}}
+        register(self.config["registry_dir"], id="radio", name="Radio",
+                 url="http://127.0.0.1:%d" % self.port, port=self.port)
+        app = collect.collect(self.config, {}, int(time.time()))["apps"][0]
+        self.assertEqual("error", app["metrics"]["status"])
+        self.assertIn("answers as app 'cocina'", app["metrics"]["error"])
+        self.assertEqual("degraded", app["state"])
+
+    def test_falls_back_to_the_next_address(self):
+        FakeHandler.EXTRA = {"monitor": {"id": "radio"}}
+        register(self.config["registry_dir"], id="radio", name="Radio", url="http://127.0.0.1:%d" % self.port,
+                 socket=os.path.join(self.dir.name, "gone.socket"),
+                 listeners={"tcp": [self.port], "unix": []})
+        app = collect.collect(self.config, {}, int(time.time()))["apps"][0]
+        self.assertEqual("ok", app["metrics"]["status"])
+        self.assertEqual("port %d" % self.port, app["metrics"]["via"])
+
+    def test_address_order(self):
+        app = {"socket": "/tmp/a.socket", "port": 3000,
+               "listeners": {"unix": ["/tmp/a.socket", "/tmp/b.socket"], "tcp": [3000, 3001]}}
+        self.assertEqual([("unix", "/tmp/a.socket"), ("unix", "/tmp/b.socket"), ("tcp", 3000), ("tcp", 3001)],
+                         collect.addresses(app))
+
+    def test_nothing_listening_is_down(self):
+        register(self.config["registry_dir"], id="radio", name="Radio",
+                 url="http://127.0.0.1:%d" % self.port, socket=os.path.join(self.dir.name, "gone.socket"))
+        app = collect.collect(self.config, {}, int(time.time()))["apps"][0]
+        self.assertEqual("down", app["state"])
+        self.assertTrue(any("gone.socket" in r for r in app["reasons"]), app["reasons"])
 
 
 if __name__ == "__main__":

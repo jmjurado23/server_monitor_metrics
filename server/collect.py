@@ -13,6 +13,7 @@ Standard library only; keep it compatible with Python 3.6 (no walrus, no match).
 
 import argparse
 import fcntl
+import http.client
 import hashlib
 import json
 import os
@@ -404,7 +405,7 @@ def summarize_traffic(app_traffic, now, error):
 
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 # Fields an app may declare about itself (registry file / metrics "monitor").
-APP_FIELDS = ("name", "url", "hosts", "port", "screen", "health_path", "order", "slow_ms",
+APP_FIELDS = ("name", "url", "hosts", "port", "socket", "screen", "health_path", "order", "slow_ms",
               "enabled", "metrics_path")
 
 
@@ -434,6 +435,8 @@ def read_registry(config):
             app["project"] = os.path.basename(entry["root"].rstrip("/"))
         if entry.get("port_source"):
             app["port_source"] = entry["port_source"]
+        if isinstance(entry.get("listeners"), dict):
+            app["listeners"] = entry["listeners"]
         apps[entry["id"]] = app
     return apps, problems
 
@@ -448,6 +451,9 @@ def validate_entry(entry):
     port = entry.get("port")
     if port is not None and not (isinstance(port, int) and 0 < port < 65536):
         return "invalid port %r" % port
+    sock = entry.get("socket")
+    if sock is not None and not str(sock).startswith("/"):
+        return "invalid socket %r" % sock
     return None
 
 
@@ -541,10 +547,75 @@ def cert_days(url, cache, now):
     return days
 
 
-def port_open(port):
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTP over a Unix socket, the way nginx reaches apps bound to
+    unix:///tmp/<app>.socket."""
+
+    def __init__(self, path, timeout=10):
+        http.client.HTTPConnection.__init__(self, "localhost", timeout=timeout)
+        self.socket_path = path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        try:
+            sock.connect(self.socket_path)
+        except OSError:
+            sock.close()
+            raise
+        self.sock = sock
+
+
+def addresses(app):
+    """Where the app can be reached locally, best first: its declared socket
+    and port, then anything else it reported listening on."""
+    found = []
+    listeners = app.get("listeners") or {}
+    for path in [app.get("socket")] + list(listeners.get("unix") or []):
+        if path and ("unix", path) not in found:
+            found.append(("unix", path))
+    for port in [app.get("port")] + list(listeners.get("tcp") or []):
+        if port and ("tcp", int(port)) not in found:
+            found.append(("tcp", int(port)))
+    return found
+
+
+def describe(address):
+    kind, where = address
+    return where if kind == "unix" else "port %s" % where
+
+
+def local_get(address, path, headers, timeout):
+    """GET over a Unix socket or 127.0.0.1:port. Returns (code, body, ms, error)."""
+    kind, where = address
+    started = time.time()
+    conn = UnixHTTPConnection(where, timeout=timeout) if kind == "unix" else \
+        http.client.HTTPConnection("127.0.0.1", int(where), timeout=timeout)
     try:
-        with socket.create_connection(("127.0.0.1", int(port)), timeout=2):
-            return True
+        conn.request("GET", path, headers=dict({"User-Agent": USER_AGENT, "Host": "localhost"}, **headers))
+        resp = conn.getresponse()
+        body = resp.read(2 * 1024 * 1024)
+        return resp.status, body, (time.time() - started) * 1000, None
+    except Exception as e:  # noqa: BLE001 - any failure is a result
+        return None, b"", (time.time() - started) * 1000, short_error(e)
+    finally:
+        conn.close()
+
+
+def is_listening(address):
+    kind, where = address
+    try:
+        if kind == "unix":
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            try:
+                sock.connect(where)
+            finally:
+                sock.close()
+        else:
+            with socket.create_connection(("127.0.0.1", int(where)), timeout=2):
+                pass
+        return True
     except OSError:
         return False
 
@@ -559,28 +630,47 @@ def screen_sessions():
 
 
 def fetch_app_metrics(app, token):
-    port = app.get("port")
-    if not port:
+    """Asks each local address of the app in turn; the first one that answers
+    *as this app* wins. Another app answering (two apps reporting the same
+    port) is rejected instead of showing its numbers under the wrong name."""
+    candidates = addresses(app)
+    if not candidates:
         return {"status": "unconfigured",
-                "error": "port unknown: set a.port in the initializer or `port` in apps.json"}
+                "error": "address unknown: set a.port or a.socket in the initializer, "
+                         "or `port`/`socket` in apps.json"}
     if not token:
         return {"status": "error", "error": "no token file on the server"}
-    url = "http://127.0.0.1:%s%s" % (port, app.get("metrics_path", "/internal/metrics"))
-    code, body, ms, error = http_get(url, headers={"X-Monitor-Token": token},
-                                     timeout=app.get("metrics_timeout", 20), follow=False)
-    if error:
-        return {"status": "error", "error": error}
-    if code == 404:
+    path = app.get("metrics_path", "/internal/metrics")
+    timeout = app.get("metrics_timeout", 20)
+    failures, saw_404 = [], False
+    for address in candidates:
+        code, body, ms, error = local_get(address, path, {"X-Monitor-Token": token}, timeout)
+        where = describe(address)
+        if error:
+            failures.append("%s: %s" % (where, error))
+            continue
+        if code == 404:
+            saw_404 = True
+            continue
+        if code != 200:
+            failures.append("%s: HTTP %s" % (where, code))
+            continue
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except ValueError as e:
+            failures.append("%s: %s" % (where, short_error(e)))
+            continue
+        other = (data.get("monitor") or {}).get("id")
+        if other and other != app["id"]:
+            failures.append("%s answers as app '%s'" % (where, other))
+            continue
+        data["status"] = "ok"
+        data["ms"] = round(ms)
+        data["via"] = where
+        return data
+    if saw_404 and not failures:
         return {"status": "not_installed"}
-    if code != 200:
-        return {"status": "error", "error": "HTTP %s" % code}
-    try:
-        data = json.loads(body.decode("utf-8"))
-    except ValueError as e:
-        return {"status": "error", "error": short_error(e)}
-    data["status"] = "ok"
-    data["ms"] = round(ms)
-    return data
+    return {"status": "error", "error": "; ".join(failures)[:300] or "no answer"}
 
 
 def decide_state(app, result, config):
@@ -597,7 +687,7 @@ def decide_state(app, result, config):
         reasons.append("HTTP %s from %s" % (public["code"], app["url"]))
     if result.get("port_open") is False:
         down = True
-        reasons.append("nothing listening on port %s" % app.get("port"))
+        reasons.append("nothing listening on %s" % result.get("address", "its local address"))
     if result.get("screen") is False:
         reasons.append("screen session '%s' missing" % app.get("screen"))
     metric_list = [m for m in (result["metrics"].get("metrics") or []) if isinstance(m, dict)]
@@ -785,11 +875,13 @@ def collect(config, state, now=None):
             continue
         r = {"id": app["id"], "name": app.get("name", app["id"]), "url": app["url"],
              "project": app.get("project"), "order": app.get("order", 100),
-             "source": app.get("source"), "port": app.get("port"),
+             "source": app.get("source"), "port": app.get("port"), "socket": app.get("socket"),
              "port_source": app.get("port_source")}
         r["public"] = check_public(app)
         r["cert_days"] = cert_days(app["url"], cert_cache, now)
-        r["port_open"] = port_open(app["port"]) if app.get("port") else None
+        local = addresses(app)
+        r["address"] = describe(local[0]) if local else None
+        r["port_open"] = any(is_listening(a) for a in local) if local else None
         r["screen"] = (app["screen"] in sessions) if (app.get("screen") and sessions is not None) else None
         r["traffic"] = summarize_traffic(state.get("traffic", {}).get(app["id"]), now,
                                          log_errors.get(app["id"]) if app.get("access_log") else "no access_log configured")
@@ -853,8 +945,10 @@ def main(argv=None):
         if args.list:
             apps, problems = discover_apps(config)
             for app in apps:
-                print("%-14s %-28s port=%-6s %-16s %s" % (app["id"], app.get("name", ""), app.get("port"),
-                                                          app.get("source"), app["url"]))
+                local = addresses(app)
+                where = describe(local[0]) if local else "ADDRESS UNKNOWN"
+                print("%-14s %-24s %-28s %-16s %s" % (app["id"], app.get("name", "")[:24], where,
+                                                      app.get("source"), app["url"]))
             for problem in problems:
                 print("problem: " + problem, file=sys.stderr)
             return 0
