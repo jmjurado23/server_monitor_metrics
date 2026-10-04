@@ -1,0 +1,16 @@
+{
+  "_comment": "Copy to dashboard.json. Views: 'overview', 'apps' (every app the collector finds, in the order each app declares) or 'app:<id>' for one app. Open http://localhost:8080/?screen=1 on the first display, ?screen=2 on the second.",
+  "title": "Servidor",
+  "rotate_seconds": 20,
+  "focus_problems": true,
+  "stale_after_seconds": 240,
+  "screens": {
+    "1": [
+      "overview",
+      "apps"
+    ],
+    "2": [
+      "overview"
+    ]
+  }
+}

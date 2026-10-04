@@ -1,0 +1,23 @@
+{
+  "_comment": "Copy to apps.json on the server. Apps with the monitor_metrics gem (>= 0.2) register themselves in registry_dir and need no entry here. List under 'apps' only sites without the gem, or server-side overrides for a registered app (same id), e.g. a different access_log.",
+  "output": "/var/www/wallmon/status.json",
+  "state": "~/.local/state/wallmon/state.json",
+  "token_file": "~/.monitor_metrics_token",
+  "registry_dir": "~/.wallmon/apps.d",
+  "access_log": "/var/log/nginx/access.log",
+  "history_hours": 24,
+  "interval_s": 60,
+  "slow_ms": 2000,
+  "cert_warn_days": 14,
+  "disk_paths": ["/"],
+  "docker_watch": [],
+  "apps": [
+    {
+      "_comment": "example of a site without the gem: public check, TLS and traffic only",
+      "id": "example-static",
+      "name": "Static site",
+      "url": "https://example.org",
+      "enabled": false
+    }
+  ]
+}

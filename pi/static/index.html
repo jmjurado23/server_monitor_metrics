@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wall Monitor</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span id="title">Servidor</span>
+      <span id="view-name" class="muted"></span>
+    </div>
+    <div id="host" class="host"></div>
+    <div class="clockbox">
+      <div id="clock" class="clock"></div>
+      <div id="fresh" class="fresh muted"></div>
+    </div>
+  </header>
+  <div id="banner" class="banner" hidden></div>
+  <main id="view"></main>
+  <footer class="footer">
+    <div id="events" class="events"></div>
+    <div id="dots" class="dots"></div>
+  </footer>
+  <div id="tip" class="tip" hidden></div>
+  <script src="/app.js"></script>
+</body>
+</html>

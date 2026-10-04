@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# real configs live only on the machines that use them
+server/apps.json
+pi/dashboard.json
+pi/wallmon.env
+.scratch/
